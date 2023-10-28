@@ -1,4 +1,8 @@
 # Train diffusion model on D4RL transitions.
+
+import sys
+print(sys.path)
+
 import argparse
 import pathlib
 
