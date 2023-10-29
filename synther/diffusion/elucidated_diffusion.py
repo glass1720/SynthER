@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from accelerate import Accelerator
 from einops import reduce
 from ema_pytorch import EMA
 from redq.algos.core import ReplayBuffer
@@ -286,12 +285,8 @@ class Trainer(object):
             split_batches: bool = True,
     ):
         super().__init__()
-        self.accelerator = Accelerator(
-            split_batches=split_batches,
-            mixed_precision='fp16' if fp16 else 'no'
-        )
-        self.accelerator.native_amp = amp
-        self.model = diffusion_model
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = diffusion_model.to(self.device)
 
         num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f'Number of trainable parameters: {num_params}.')
@@ -309,7 +304,6 @@ class Trainer(object):
             print(f'Using batch size: {self.batch_size}')
             # dataset and dataloader
             dl = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count())
-            dl = self.accelerator.prepare(dl)
             self.dl = cycle(dl)
         else:
             # No dataloader, train batch by batch
@@ -331,16 +325,13 @@ class Trainer(object):
         self.opt = torch.optim.AdamW(optimizer_grouped_parameters, lr=train_lr, betas=adam_betas)
 
         # for logging results in a folder periodically
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
-            self.results_folder = pathlib.Path(results_folder)
-            self.results_folder.mkdir(exist_ok=True)
+    
+        self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
+        self.results_folder = pathlib.Path(results_folder)
+        self.results_folder.mkdir(exist_ok=True)
 
         # step counter state
         self.step = 0
-
-        # prepare model, dataloader, optimizer with accelerator
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
         if lr_scheduler == 'linear':
             print('using linear learning rate scheduler')
@@ -356,60 +347,60 @@ class Trainer(object):
             )
         else:
             self.lr_scheduler = None
+        
+        self.scaler = None
+        if amp:
+            self.scaler = torch.cuda.amp.GradScaler()
 
-        self.model.normalizer.to(self.accelerator.device)
-        self.ema.ema_model.normalizer.to(self.accelerator.device)
+        self.model.normalizer.to(self.device)
+        self.ema.ema_model.normalizer.to(self.device)
 
     def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
-
         data = {
-            'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
-            'opt': self.opt.state_dict(),
-            'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-        }
+        'step': self.step,
+        'model': self.model.state_dict(),
+        'opt': self.opt.state_dict(),
+        'ema': self.ema.state_dict(),
+        'scaler': getattr(self, 'scaler', None).state_dict() if hasattr(self, 'scaler') else None,
+    }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone: int):
-        accelerator = self.accelerator
-        device = accelerator.device
+        device = self.device
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
 
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
+        self.model.load_state_dict(data['model'])
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
         self.ema.load_state_dict(data['ema'])
 
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
+        if hasattr(self, 'scaler') and 'scaler' in data and data['scaler'] is not None:
+            self.scaler.load_state_dict(data['scaler'])
 
     # Train for the full number of steps.
     def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
+        device = self.device
+        with tqdm(initial=self.step, total=self.train_num_steps) as pbar:
             while self.step < self.train_num_steps:
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
                     data = (next(self.dl)[0]).to(device)
 
-                    with self.accelerator.autocast():
+                    with torch.cuda.amp.autocast(enabled=self.scaler is not None):
                         loss = self.model(data)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
-                    self.accelerator.backward(loss)
+                    if self.scaler:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 pbar.set_description(f'loss: {total_loss:.4f}')
                 wandb.log({
                     'step': self.step,
@@ -417,27 +408,27 @@ class Trainer(object):
                     'lr': self.opt.param_groups[0]['lr']
                 })
 
-                accelerator.wait_for_everyone()
+                if self.scaler:
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
+                else:
+                    self.opt.step()
 
-                self.opt.step()
                 self.opt.zero_grad()
-
-                accelerator.wait_for_everyone()
-
                 self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.to(device)
-                    self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                        self.save(self.step)
+                self.ema.to(device)
+                self.ema.update()
+
+                if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    self.save(self.step)
 
                 pbar.update(1)
 
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
-        accelerator.print('training complete')
+        print('training complete')
 
     # Allow user to pass in external data.
     def train_on_batch(
@@ -447,36 +438,37 @@ class Trainer(object):
             splits=1,  # number of splits to split the batch into
             **kwargs,
     ):
-        accelerator = self.accelerator
-        device = accelerator.device
+        device = self.device
         data = data.to(device)
+        
+        total_loss = 0.0
 
-        total_loss = 0.
         if splits == 1:
-            with self.accelerator.autocast():
-                loss = self.model(data, **kwargs)
-                total_loss += loss.item()
-            self.accelerator.backward(loss)
+            loss = self.model(data, **kwargs)
+            total_loss += loss.item()
+            loss.backward()
         else:
-            assert splits > 1 and data.shape[0] % splits == 0
-            split_data = torch.split(data, data.shape[0] // splits)
+            split_size = data.shape[0] // splits
+            assert splits > 1 and data.shape[0] % splits == 0, "Invalid splits"
+            
+            data_splits = torch.split(data, split_size)
 
-            for idx, d in enumerate(split_data):
-                with self.accelerator.autocast():
-                    # Split condition as well
-                    new_kwargs = {}
-                    for k, v in kwargs.items():
-                        if isinstance(v, torch.Tensor):
-                            new_kwargs[k] = torch.split(v, v.shape[0] // splits)[idx]
-                        else:
-                            new_kwargs[k] = v
+            for idx, d in enumerate(data_splits):
+                # Handle tensor splits in kwargs
+                split_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, torch.Tensor):
+                        split_kwargs[k] = torch.split(v.to(device), split_size)[idx]
+                    else:
+                        split_kwargs[k] = v
 
-                    loss = self.model(d, **new_kwargs)
-                    loss = loss / splits
-                    total_loss += loss.item()
-                self.accelerator.backward(loss)
+                loss = self.model(d, **split_kwargs) / splits
+                total_loss += loss.item()
+                loss.backward()
 
-        accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+        # Clip gradients and step optimizer
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
         if use_wandb:
             wandb.log({
                 'step': self.step,
@@ -484,20 +476,13 @@ class Trainer(object):
                 'lr': self.opt.param_groups[0]['lr'],
             })
 
-        accelerator.wait_for_everyone()
-
         self.opt.step()
         self.opt.zero_grad()
 
-        accelerator.wait_for_everyone()
-
         self.step += 1
-        if accelerator.is_main_process:
-            self.ema.to(device)
-            self.ema.update()
 
-            if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                self.save(self.step)
+        if self.step % self.save_and_sample_every == 0:
+            self.save(self.step)
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
