@@ -93,7 +93,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_samples', action='store_true', default=True)
     parser.add_argument('--save_num_samples', type=int, default=int(5e6))
     parser.add_argument('--save_file_name', type=str, default='5m_samples.npz')
-    parser.add_argument('--load_checkpoint', action='store_true')
+    # Tweak to load from checkpoint by default
+    parser.add_argument('--load_checkpoint', action='store_true', default=True)
     args = parser.parse_args()
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
