@@ -136,7 +136,7 @@ if __name__ == '__main__':
         # Train model.
         trainer.train()
     else:
-        trainer.ema.to(trainer.accelerator.device)
+        trainer.ema.to(trainer.device)
         # Load the last checkpoint.
         trainer.load(milestone=trainer.train_num_steps)
 
